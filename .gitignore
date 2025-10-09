@@ -1,0 +1,14 @@
+# Ignore CSV files
+*.csv
+
+__pycache__
+
+*.pt
+
+*.png
+
+torch
+
+*.pkl
+
+unsloth_compiled_cache
