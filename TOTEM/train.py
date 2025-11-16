@@ -90,8 +90,57 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import RobustScaler, OneHotEncoder
+from tqdm import tqdm
 
 df = pd.read_csv("oasis3_clinical.csv", low_memory=False)
+
+# --- Identify meta columns
+time_col_candidates = ["days_to_visit"]
+patient_col_candidates = ["OASIS_session_label", "patient_id"]
+
+time_col = next((c for c in time_col_candidates if c in df.columns), None)
+pid_col  = next((c for c in patient_col_candidates if c in df.columns), None)
+
+if pid_col is None:
+    raise ValueError("No patient ID column found.")
+
+if time_col is None:
+    print("⚠️ No time column found — using row index as temporal order")
+    df["__t__"] = df.groupby(pid_col).cumcount()
+    time_col = "__t__"
+
+# --- Drop rows with no patient ID
+df = df.dropna(subset=[pid_col])
+
+# --- Fill missing data carefully
+df = df.copy()
+df = df.fillna("missing")
+
+# --- Remove ID/time columns from features
+feature_cols = [c for c in df.columns if c not in [pid_col, time_col]]
+
+# --- Final structure: dict[patient_id] = list of events
+patient_events = {}
+
+for pid, group in tqdm(df.groupby(pid_col)):
+    group = group.sort_values(time_col)
+
+    events = []
+    for _, row in group.iterrows():
+        t = row[time_col]
+
+        for col in feature_cols:
+            value = row[col]
+            events.append((t, col, value))
+
+    patient_events[pid] = events
+
+# Example output:
+# patient_events["S1"] → list of (t, variate_name, variate_value)
+print("Example:", patient_events[next(iter(patient_events))][:10])
+print(patient_events)
+
+exit()
 
 # Keep IDs for temporal grouping
 id_cols = ["patient_id", "session_id", "days_to_visit"]
