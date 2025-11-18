@@ -94,23 +94,34 @@ from tqdm import tqdm
 
 df = pd.read_csv("oasis3_clinical.csv", low_memory=False)
 
-# --- Identify meta columns
-time_col_candidates = ["days_to_visit"]
-patient_col_candidates = ["OASIS_session_label", "patient_id"]
+# --- Identify meta columns (FORCE grouping by patient_id)
+pid_col = "patient_id"
+if pid_col not in df.columns:
+    raise ValueError("Expected a 'patient_id' column in the CSV.")
 
-time_col = next((c for c in time_col_candidates if c in df.columns), None)
-pid_col  = next((c for c in patient_col_candidates if c in df.columns), None)
-
-if pid_col is None:
-    raise ValueError("No patient ID column found.")
-
-if time_col is None:
-    print("⚠️ No time column found — using row index as temporal order")
+# Prefer days_to_visit as the time column; fallback to artificial index
+if "days_to_visit" in df.columns:
+    time_col = "days_to_visit"
+else:
+    print("⚠️ No days_to_visit column found — using row index as temporal order")
     df["__t__"] = df.groupby(pid_col).cumcount()
     time_col = "__t__"
 
 # --- Drop rows with no patient ID
 df = df.dropna(subset=[pid_col])
+
+# --- Fill missing data carefully
+df = df.copy()
+df = df.fillna("missing")
+
+# --- Remove ID/time columns from features
+feature_cols = [c for c in df.columns if c not in [pid_col, time_col]]
+
+# Drop session-like IDs from features if present
+drop_from_features = ["OASIS_session_label", "session_id"]
+feature_cols = [c for c in feature_cols if c not in drop_from_features]
+
+
 
 # --- Fill missing data carefully
 df = df.copy()
@@ -260,12 +271,16 @@ var_embedder  = VariateEmbedding(num_variates=num_variates, d_model=d_model)
 time_embedder = TimeDeltaEmbedding(d_model=d_model, hidden_dim=64)
 
 # Example forward calls (JUST to verify shapes; you can delete this later)
+# Just use a small batch of patients to verify shapes
+BATCH_PATIENTS = 8  # or 4, whatever
+
 with torch.no_grad():
-    e_variate = var_embedder(padded_variate_ids)   # (B, T, d_model)
-    e_time    = time_embedder(padded_delta_t)      # (B, T, d_model)
+    e_variate = var_embedder(padded_variate_ids[:BATCH_PATIENTS])
+    e_time    = time_embedder(padded_delta_t[:BATCH_PATIENTS])
 
 print("e_variate shape:", e_variate.shape)
 print("e_time shape:", e_time.shape)
+
 
 
 
