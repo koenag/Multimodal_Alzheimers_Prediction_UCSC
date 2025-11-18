@@ -235,11 +235,190 @@ class TimeDeltaEmbedding(nn.Module):
         return self.mlp(delta_t)
 
 # ==========================
-# Build patient sequences of (variate_id) and (delta_t_norm)
+# STEP 3: Classify variates by type (numeric / categorical / text)
 # ==========================
 
-seqs_variate = []
-seqs_deltat = []
+# Heuristic: figure out which feature columns are numeric based on df before casting
+numeric_variates = []
+categorical_variates = []
+text_variates = []
+
+for col in feature_cols:
+    # Try to see if this column is mostly numeric
+    col_series = df[col].replace("missing", np.nan)
+    col_num = pd.to_numeric(col_series, errors="coerce")
+    frac_numeric = col_num.notna().mean()
+
+    if frac_numeric > 0.9:
+        numeric_variates.append(col)
+    else:
+        categorical_variates.append(col)
+
+print("numeric_variates:", numeric_variates[:10], "...")
+print("categorical_variates:", categorical_variates[:10], "...")
+print("text_variates:", text_variates)
+
+# ---- Numeric values: convert to float and compute per-variate stats
+events_df["value_num"] = pd.to_numeric(
+    events_df["value"].replace("missing", np.nan), errors="coerce"
+)
+
+num_stats = (
+    events_df[events_df["variate"].isin(numeric_variates)]
+    .groupby("variate")["value_num"]
+    .agg(["mean", "std"])
+    .reset_index()
+)
+
+# Ensure no zero std to avoid division by zero
+num_stats["std"] = num_stats["std"].replace(0, 1.0).fillna(1.0)
+num_stats["mean"] = num_stats["mean"].fillna(0.0)
+
+# Build tensors aligned with variate_id indices: for each variate_id, store mean/std and type
+VAR_TYPE_NUM = 0
+VAR_TYPE_CAT = 1
+VAR_TYPE_TEXT = 2
+
+variate_type = torch.full((num_variates,), VAR_TYPE_CAT, dtype=torch.long)  # default categorical
+numeric_means = torch.zeros(num_variates, dtype=torch.float32)
+numeric_stds  = torch.ones(num_variates,  dtype=torch.float32)
+
+for _, row in num_stats.iterrows():
+    vname = row["variate"]
+    if vname not in variate2id:
+        continue
+    vid = variate2id[vname]
+    variate_type[vid] = VAR_TYPE_NUM
+    numeric_means[vid] = float(row["mean"])
+    numeric_stds[vid]  = float(row["std"])
+
+for vname in text_variates:
+    if vname in variate2id:
+        variate_type[variate2id[vname]] = VAR_TYPE_TEXT
+
+# ---- Categorical values: build a global vocabulary over (variate, value) pairs
+cat_rows = events_df[events_df["variate"].isin(categorical_variates)][["variate", "value"]].drop_duplicates()
+cat_rows = cat_rows.reset_index(drop=True)
+cat_rows["cat_id"] = np.arange(len(cat_rows), dtype=np.int64)
+
+pair2cat_id = {(r.variate, r.value): int(r.cat_id) for r in cat_rows.itertuples()}
+
+events_df["cat_id"] = -1
+mask_cat = events_df["variate"].isin(categorical_variates)
+events_df.loc[mask_cat, "cat_id"] = events_df.loc[mask_cat].apply(
+    lambda r: pair2cat_id[(r["variate"], r["value"])], axis=1
+)
+
+num_cat_tokens = len(cat_rows)
+print("num_cat_tokens:", num_cat_tokens)
+
+
+# ==========================
+# STEP 4: Event value embedding module (e_value)
+# ==========================
+
+class EventValueEmbedding(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        num_variates,
+        variate_type_tensor,
+        numeric_means,
+        numeric_stds,
+        num_cat_tokens,
+        text_encoder=None,  # optional: plug in a clinical LM wrapper later
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # Register buffers so they move with .to(device) and are saved with state_dict
+        self.register_buffer("variate_type", variate_type_tensor.clone())
+        self.register_buffer("numeric_means", numeric_means.clone())
+        self.register_buffer("numeric_stds",  numeric_stds.clone())
+
+        # Numeric value MLP: Case A (floats)
+        self.numeric_mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(),
+            nn.Linear(64, d_model),
+        )
+
+        # Categorical value embedding: Case B (bool/categorical)
+        if num_cat_tokens > 0:
+            self.cat_embed = nn.Embedding(num_cat_tokens, d_model)
+        else:
+            self.cat_embed = None
+
+        # Text encoder: Case C (clinical notes) – you can wire in a pre-trained LM here
+        self.text_encoder = text_encoder  # should map a batch of text -> (B, T, d_model) or similar
+
+        # Type constants
+        self.VAR_TYPE_NUM = VAR_TYPE_NUM
+        self.VAR_TYPE_CAT = VAR_TYPE_CAT
+        self.VAR_TYPE_TEXT = VAR_TYPE_TEXT
+
+    def forward(self, variate_ids, value_num, cat_ids, texts=None):
+        """
+        variate_ids : LongTensor (B, T)
+        value_num   : FloatTensor (B, T) - raw or prefilled floats (0.0 for non-numeric)
+        cat_ids     : LongTensor (B, T) - categorical IDs, -1 for non-categorical
+        texts       : optional nested list/array [[str_or_None]*T]*B for text features
+
+        returns:
+            e_value : FloatTensor (B, T, d_model)
+        """
+        B, T = variate_ids.shape
+        device = variate_ids.device
+
+        # Initialize with zeros
+        e_value = torch.zeros(B, T, self.d_model, device=device)
+
+        # Lookup per-token variate types
+        var_types = self.variate_type[variate_ids]  # (B, T)
+
+        # ----- Case A: numeric -----
+        mask_num = (var_types == self.VAR_TYPE_NUM)
+
+        if mask_num.any():
+            # gather means/stds for each event
+            mu = self.numeric_means[variate_ids]     # (B, T)
+            sigma = self.numeric_stds[variate_ids]   # (B, T)
+            # normalize
+            v = (value_num - mu) / sigma
+            v = v.unsqueeze(-1)                      # (B, T, 1)
+            e_num_full = self.numeric_mlp(v)         # (B, T, d_model)
+            e_value[mask_num] = e_num_full[mask_num]
+
+        # ----- Case B: categorical / boolean -----
+        if self.cat_embed is not None:
+            mask_cat = (var_types == self.VAR_TYPE_CAT) & (cat_ids >= 0)
+            if mask_cat.any():
+                # cat_ids is (B, T)
+                cat_ids_clamped = cat_ids.clone()
+                cat_ids_clamped[cat_ids_clamped < 0] = 0  # avoid -1 indexing
+                e_cat_full = self.cat_embed(cat_ids_clamped)  # (B, T, d_model)
+                e_value[mask_cat] = e_cat_full[mask_cat]
+
+        # ----- Case C: text (optional, stub) -----
+        # If you have free-text notes and a text encoder, you can handle them here.
+        # Example (pseudo-code):
+        # if self.text_encoder is not None and texts is not None:
+        #     mask_text = (var_types == self.VAR_TYPE_TEXT)
+        #     # Pack texts[batch][time] where mask_text is True, run encoder, then scatter back.
+
+        return e_value
+    
+
+# ==========================
+# STEP 5: Build sequences for variate_id, delta_t_norm, value_num and cat_id
+# ==========================
+
+from torch.nn.utils.rnn import pad_sequence
+
+seqs_variate   = []   # List[Tensor(T,)]
+seqs_deltat    = []   # List[Tensor(T,)]
+seqs_value_num = []   # List[Tensor(T,)]
+seqs_cat_id    = []   # List[Tensor(T,)]
 
 for pid, group in events_df.groupby(pid_col):
     group = group.sort_values(time_col)
@@ -247,42 +426,75 @@ for pid, group in events_df.groupby(pid_col):
     var_ids = torch.tensor(group["variate_id"].values, dtype=torch.long)
     dt_norm = torch.tensor(group["delta_t_norm"].values, dtype=torch.float32)
 
+    # numeric values: float32; NaN -> 0.0 (we'll also use per-variate means/std in the module)
+    v_num = torch.tensor(
+        group["value_num"].fillna(0.0).values, dtype=torch.float32
+    )
+
+    # categorical ids: int64; -1 for non-categorical
+    v_cat = torch.tensor(
+        group["cat_id"].fillna(-1).values, dtype=torch.long
+    )
+
     if len(var_ids) == 0:
         continue
 
     seqs_variate.append(var_ids)
     seqs_deltat.append(dt_norm)
+    seqs_value_num.append(v_num)
+    seqs_cat_id.append(v_cat)
 
-PAD_VAR_ID = 0      # you *can* treat 0 as a real variate for now, or later reserve a PAD id
-PAD_DT = 0.0
+PAD_VAR_ID  = 0
+PAD_DT      = 0.0
+PAD_NUMVAL  = 0.0
+PAD_CAT_ID  = -1
 
-padded_variate_ids = pad_sequence(seqs_variate, batch_first=True, padding_value=PAD_VAR_ID)
-padded_delta_t      = pad_sequence(seqs_deltat,  batch_first=True, padding_value=PAD_DT)
+padded_variate_ids = pad_sequence(seqs_variate,    batch_first=True, padding_value=PAD_VAR_ID)
+padded_delta_t      = pad_sequence(seqs_deltat,     batch_first=True, padding_value=PAD_DT)
+padded_value_num    = pad_sequence(seqs_value_num,  batch_first=True, padding_value=PAD_NUMVAL)
+padded_cat_id       = pad_sequence(seqs_cat_id,     batch_first=True, padding_value=PAD_CAT_ID)
 
 print("padded_variate_ids shape:", padded_variate_ids.shape)
 print("padded_delta_t shape:", padded_delta_t.shape)
+print("padded_value_num shape:", padded_value_num.shape)
+print("padded_cat_id shape:", padded_cat_id.shape)
 
 # ==========================
-# Instantiate the embedding modules (no combining yet)
+# Instantiate the embedding modules and test shapes
 # ==========================
 
 d_model = 128  # or whatever dimension you want
+
 var_embedder  = VariateEmbedding(num_variates=num_variates, d_model=d_model)
 time_embedder = TimeDeltaEmbedding(d_model=d_model, hidden_dim=64)
 
-# Example forward calls (JUST to verify shapes; you can delete this later)
-# Just use a small batch of patients to verify shapes
-BATCH_PATIENTS = 8  # or 4, whatever
+value_embedder = EventValueEmbedding(
+    d_model=d_model,
+    num_variates=num_variates,
+    variate_type_tensor=variate_type,
+    numeric_means=numeric_means,
+    numeric_stds=numeric_stds,
+    num_cat_tokens=num_cat_tokens,
+    text_encoder=None,  # later
+)
+
+event_layernorm = nn.LayerNorm(d_model)
+
+BATCH_PATIENTS = 8
 
 with torch.no_grad():
-    e_variate = var_embedder(padded_variate_ids[:BATCH_PATIENTS])
-    e_time    = time_embedder(padded_delta_t[:BATCH_PATIENTS])
+    v_ids   = padded_variate_ids[:BATCH_PATIENTS]
+    dt_norm = padded_delta_t[:BATCH_PATIENTS]
+    v_num   = padded_value_num[:BATCH_PATIENTS]
+    v_cat   = padded_cat_id[:BATCH_PATIENTS]
 
-print("e_variate shape:", e_variate.shape)
-print("e_time shape:", e_time.shape)
+    e_variate = var_embedder(v_ids)                 # (B, T, d_model)
+    e_time    = time_embedder(dt_norm)              # (B, T, d_model)
+    e_value   = value_embedder(v_ids, v_num, v_cat) # (B, T, d_model)
 
+    e_event = event_layernorm(e_variate + e_time + e_value)
 
-
+print("e_event shape:", e_event.shape)
 
 
 
