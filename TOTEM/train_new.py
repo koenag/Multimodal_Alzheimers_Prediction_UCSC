@@ -537,8 +537,16 @@ model = get_peft_model(model, lora_config)
 def collate_fn(batch):
     prompts = [b["input_text"] for b in batch]
     targets = [b["target_text"] for b in batch]
-    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    labels = tokenizer(targets, return_tensors="pt", padding=True, truncation=True).input_ids
+
+    # 🔧 FIX: tokenize *targets* for both input_ids and labels
+    encoded = tokenizer(
+        targets,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    labels = encoded.input_ids.clone()
+
     evs = [b["event_embeddings"] for b in batch]
     T_ev = max([e.shape[0] for e in evs])
     ev_padded = []
@@ -546,14 +554,21 @@ def collate_fn(batch):
     for e in evs:
         pad_len = T_ev - e.shape[0]
         if pad_len > 0:
-            e = torch.cat([e, torch.zeros((pad_len, e.shape[1]), dtype=e.dtype)], dim=0)
-            mask = torch.cat([torch.ones(e.shape[0]-pad_len), torch.zeros(pad_len)])
+            e = torch.cat(
+                [e, torch.zeros((pad_len, e.shape[1]), dtype=e.dtype)], dim=0
+            )
+            # 1 for valid events, 0 for padded
+            mask = torch.cat(
+                [torch.ones(e.shape[0] - pad_len), torch.zeros(pad_len)]
+            )
         else:
             mask = torch.ones(e.shape[0])
         ev_padded.append(e)
         ev_mask.append(mask)
-    ev_padded = torch.stack(ev_padded, dim=0)
-    ev_mask = torch.stack(ev_mask, dim=0)
+
+    ev_padded = torch.stack(ev_padded, dim=0)  # (B, T_ev, d_model)
+    ev_mask = torch.stack(ev_mask, dim=0)      # (B, T_ev)
+
     batch_data = {
         "input_ids": encoded.input_ids,
         "attention_mask": encoded.attention_mask,
@@ -562,6 +577,7 @@ def collate_fn(batch):
         "event_mask": ev_mask,
     }
     return batch_data
+
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
