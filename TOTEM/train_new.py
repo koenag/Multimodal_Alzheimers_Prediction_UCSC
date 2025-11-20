@@ -467,7 +467,7 @@ value_embedder = EventValueEmbedding(
 
 event_layernorm = nn.LayerNorm(d_model)
 
-#BATCH_PATIENTS = 64
+# BATCH_PATIENTS = 64
 
 with torch.no_grad():
     v_ids   = padded_variate_ids#[:BATCH_PATIENTS]
@@ -527,15 +527,17 @@ def discretize_value_into_bins(value_array, variate_array, variate2bin_edges, va
             continue
         out[i] = np.digitize(val, edges, right=False)
     return out
+
     
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
+
 
 HF_MODEL = "amusktweewt/tiny-model-500M-chat-v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 4
 LR = 1e-4
-EPOCHS = 50
+EPOCHS = 10
 
 tokenizer = AutoTokenizer.from_pretrained(HF_MODEL, use_fast=True)
 model = AutoModelForCausalLM.from_pretrained(HF_MODEL).to(DEVICE)
@@ -553,41 +555,25 @@ lora_config = LoraConfig(
 )
 model = get_peft_model(model, lora_config)
 
+model.gradient_checkpointing_enable()
+
+# model = torch.compile(model)
+
+scaler = torch.amp.GradScaler()
+
 def collate_fn(batch):
     prompts = [b["input_text"] for b in batch]
-
-    # Tokenize prompts once
     encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    input_ids = encoded.input_ids
+    attention_mask = encoded.attention_mask
+    labels = input_ids.clone()
 
-    input_ids = encoded.input_ids              # (B, T_txt)
-    attention_mask = encoded.attention_mask    # (B, T_txt)
-
-    # Labels must be same shape as input_ids for CausalLM
-    labels = input_ids.clone()                 # (B, T_txt)
-
-    # ----- event embeddings (same as before) -----
-    evs = [b["event_embeddings"] for b in batch]
-    T_ev = max(e.shape[0] for e in evs)
-    ev_padded = []
-    ev_mask = []
-
-    for e in evs:
-        T_i, D = e.shape
-        pad_len = T_ev - T_i
-        if pad_len > 0:
-            pad_block = torch.zeros((pad_len, D), dtype=e.dtype)
-            e_p = torch.cat([e, pad_block], dim=0)
-            mask = torch.cat([torch.ones(T_i), torch.zeros(pad_len)])
-        else:
-            e_p = e
-            mask = torch.ones(T_i)
-        ev_padded.append(e_p)
-        ev_mask.append(mask)
-
-    ev_padded = torch.stack(ev_padded, dim=0)  # (B, T_ev, d_model)
-    ev_mask   = torch.stack(ev_mask,   dim=0)  # (B, T_ev)
-
-    batch_data = {
+    evs = [b["event_embeddings"] for b in batch]  # list of (T_i, D)
+    ev_padded = pad_sequence(evs, batch_first=True)  # (B, T_ev, D)
+    ev_mask = torch.stack([torch.cat([torch.ones(e.shape[0]), torch.zeros(ev_padded.shape[1] - e.shape[0])]) 
+                           for e in evs])
+    
+    return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
@@ -595,42 +581,49 @@ def collate_fn(batch):
         "event_mask": ev_mask,
     }
 
-    # 🔥 no patient_id here anymore
-
     return batch_data
-
-
-
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
 def train_epoch(dataloader):
     model.train()
     total_loss = 0.0
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(DEVICE)
-        attn = batch["attention_mask"].to(DEVICE)
-        labels = batch["labels"].to(DEVICE)
-        evs = batch["event_embeddings"].to(DEVICE)
-        ev_mask = batch["event_mask"].to(DEVICE)
+    for batch in tqdm(dataloader):
+        input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+        attn = batch["attention_mask"].to(DEVICE, non_blocking=True)
+        labels = batch["labels"].to(DEVICE, non_blocking=True)
+        evs = batch["event_embeddings"].to(DEVICE, non_blocking=True)
+        ev_mask = batch["event_mask"].to(DEVICE, non_blocking=True)
         B, T_ev, _ = evs.shape
-        evs_proj = projector(evs.view(-1, d_model)).view(B, T_ev, embed_dim)
-        token_embeds = model.get_input_embeddings()(input_ids)
-        inputs_embeds = torch.cat([evs_proj, token_embeds], dim=1)
-        ev_prefix_mask = ev_mask.long()
-        extended_attn = torch.cat([ev_prefix_mask, attn], dim=1)
-        pad_prefix = torch.full((B, T_ev), -100, dtype=torch.long, device=labels.device)
-        labels_padded = torch.cat([pad_prefix, labels], dim=1)
-        outputs = model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=extended_attn,
-            labels=labels_padded,
-        )
-        loss = outputs.loss
-        loss.backward()
-        optimizer.step()
+        
         optimizer.zero_grad()
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            evs_proj = projector(evs.view(-1, d_model)).view(B, T_ev, embed_dim)
+            token_embeds = model.get_input_embeddings()(input_ids)
+            inputs_embeds = torch.cat([evs_proj, token_embeds], dim=1)
+            
+            ev_prefix_mask = ev_mask.long()
+            extended_attn = torch.cat([ev_prefix_mask, attn], dim=1)
+            
+            pad_prefix = torch.full((B, T_ev), -100, dtype=torch.long, device=labels.device)
+            labels_padded = torch.cat([pad_prefix, labels], dim=1)
+            
+            outputs = model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=extended_attn,
+                labels=labels_padded,
+            )
+            loss = outputs.loss
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
         total_loss += loss.item() * input_ids.size(0)
+        
+        del evs, ev_mask, evs_proj, inputs_embeds, extended_attn, outputs
+        torch.cuda.empty_cache()
+        
     return total_loss / len(dataloader.dataset)
 
 import pickle
@@ -685,13 +678,9 @@ def extract_event_prefix_embeddings(dataloader, model, projector, device, d_mode
     all_embs = torch.cat(all_embs, dim=0)   # (N, hidden_size)
     return all_embs
 
-
-
-
 # use real items built from e_event
 ds = TextWithEventsDataset(items, tokenizer)
-dl = DataLoader(ds, batch_size=BATCH, collate_fn=collate_fn)
-
+dl = DataLoader(ds, batch_size=BATCH, collate_fn=collate_fn, pin_memory=True)
 
 for epoch in range(EPOCHS):
     loss = train_epoch(dl)
