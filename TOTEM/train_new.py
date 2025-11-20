@@ -467,13 +467,13 @@ value_embedder = EventValueEmbedding(
 
 event_layernorm = nn.LayerNorm(d_model)
 
-BATCH_PATIENTS = 64
+#BATCH_PATIENTS = 64
 
 with torch.no_grad():
-    v_ids   = padded_variate_ids[:BATCH_PATIENTS]
-    dt_norm = padded_delta_t[:BATCH_PATIENTS]
-    v_num   = padded_value_num[:BATCH_PATIENTS]
-    v_cat   = padded_cat_id[:BATCH_PATIENTS]
+    v_ids   = padded_variate_ids#[:BATCH_PATIENTS]
+    dt_norm = padded_delta_t#[:BATCH_PATIENTS]
+    v_num   = padded_value_num#[:BATCH_PATIENTS]
+    v_cat   = padded_cat_id#[:BATCH_PATIENTS]
 
     e_variate = var_embedder(v_ids)
     e_time    = time_embedder(dt_norm)
@@ -482,6 +482,25 @@ with torch.no_grad():
     e_event = event_layernorm(e_variate + e_time + e_value)
 
 print("e_event shape:", e_event.shape)
+
+# ---- build one item per patient from e_event ----
+seq_lengths = [len(s) for s in seqs_variate]   # list of length 1378
+
+items = []
+num_patients = e_event.shape[0]
+
+for i in range(num_patients):
+    L_i = seq_lengths[i]          # number of real events for patient i
+    ev_i = e_event[i, :L_i].clone()   # (L_i, d_model=128)
+
+    items.append({
+        "input_text": "Patient history: ",       # or any prompt you like
+        "target_text": "Likely diagnosis: ...",  # currently unused
+        "event_embeddings": ev_i,
+    })
+
+print("Number of items built from e_event:", len(items))
+
 
 def compute_variate_quantile_bins(events_df, numeric_variates, num_bins=100, q_min=0.001, q_max=0.999):
     bins = {}
@@ -516,7 +535,7 @@ HF_MODEL = "amusktweewt/tiny-model-500M-chat-v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 4
 LR = 1e-4
-EPOCHS = 3
+EPOCHS = 50
 
 tokenizer = AutoTokenizer.from_pretrained(HF_MODEL, use_fast=True)
 model = AutoModelForCausalLM.from_pretrained(HF_MODEL).to(DEVICE)
@@ -536,47 +555,51 @@ model = get_peft_model(model, lora_config)
 
 def collate_fn(batch):
     prompts = [b["input_text"] for b in batch]
-    targets = [b["target_text"] for b in batch]
 
-    # 🔧 FIX: tokenize *targets* for both input_ids and labels
-    encoded = tokenizer(
-        targets,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    labels = encoded.input_ids.clone()
+    # Tokenize prompts once
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
 
+    input_ids = encoded.input_ids              # (B, T_txt)
+    attention_mask = encoded.attention_mask    # (B, T_txt)
+
+    # Labels must be same shape as input_ids for CausalLM
+    labels = input_ids.clone()                 # (B, T_txt)
+
+    # ----- event embeddings (same as before) -----
     evs = [b["event_embeddings"] for b in batch]
-    T_ev = max([e.shape[0] for e in evs])
+    T_ev = max(e.shape[0] for e in evs)
     ev_padded = []
     ev_mask = []
+
     for e in evs:
-        pad_len = T_ev - e.shape[0]
+        T_i, D = e.shape
+        pad_len = T_ev - T_i
         if pad_len > 0:
-            e = torch.cat(
-                [e, torch.zeros((pad_len, e.shape[1]), dtype=e.dtype)], dim=0
-            )
-            # 1 for valid events, 0 for padded
-            mask = torch.cat(
-                [torch.ones(e.shape[0] - pad_len), torch.zeros(pad_len)]
-            )
+            pad_block = torch.zeros((pad_len, D), dtype=e.dtype)
+            e_p = torch.cat([e, pad_block], dim=0)
+            mask = torch.cat([torch.ones(T_i), torch.zeros(pad_len)])
         else:
-            mask = torch.ones(e.shape[0])
-        ev_padded.append(e)
+            e_p = e
+            mask = torch.ones(T_i)
+        ev_padded.append(e_p)
         ev_mask.append(mask)
 
     ev_padded = torch.stack(ev_padded, dim=0)  # (B, T_ev, d_model)
-    ev_mask = torch.stack(ev_mask, dim=0)      # (B, T_ev)
+    ev_mask   = torch.stack(ev_mask,   dim=0)  # (B, T_ev)
 
     batch_data = {
-        "input_ids": encoded.input_ids,
-        "attention_mask": encoded.attention_mask,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
         "labels": labels,
         "event_embeddings": ev_padded,
         "event_mask": ev_mask,
     }
+
+    # 🔥 no patient_id here anymore
+
     return batch_data
+
+
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -610,16 +633,65 @@ def train_epoch(dataloader):
         total_loss += loss.item() * input_ids.size(0)
     return total_loss / len(dataloader.dataset)
 
-toy_items = [
-    {
-      "input_text": "Patient history: ",
-      "target_text": "Likely diagnosis: ...",
-      "event_embeddings": torch.randn(5, d_model),
-    },
-]
+import pickle
 
-ds = TextWithEventsDataset(toy_items, tokenizer)
+@torch.no_grad()
+def extract_event_prefix_embeddings(dataloader, model, projector, device, d_model, embed_dim, pool="mean"):
+    model.eval()
+    projector.eval()
+
+    all_embs = []
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attn      = batch["attention_mask"].to(device)
+        evs       = batch["event_embeddings"].to(device)
+        ev_mask   = batch["event_mask"].to(device)
+
+        B, T_ev, _ = evs.shape
+
+        evs_proj = projector(evs.view(-1, d_model)).view(B, T_ev, embed_dim)
+        token_embeds = model.get_input_embeddings()(input_ids)
+        inputs_embeds = torch.cat([evs_proj, token_embeds], dim=1)
+
+        ev_prefix_mask = ev_mask.long()
+        extended_attn = torch.cat([ev_prefix_mask, attn], dim=1)
+
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=extended_attn,
+            output_hidden_states=True,
+        )
+
+        last_hidden = outputs.hidden_states[-1]  # (B, T_ev+T_txt, hidden_size)
+        ev_hidden = last_hidden[:, :T_ev, :]     # (B, T_ev, hidden_size)
+
+        mask = ev_mask.unsqueeze(-1)
+        ev_hidden_masked = ev_hidden * mask
+
+        lengths = ev_mask.sum(dim=1, keepdim=True).clamp(min=1)
+
+        if pool == "mean":
+            pooled = ev_hidden_masked.sum(dim=1) / lengths
+        elif pool == "max":
+            neg_inf = torch.finfo(ev_hidden_masked.dtype).min
+            ev_hidden_masked_masked = ev_hidden.masked_fill(mask == 0, neg_inf)
+            pooled, _ = ev_hidden_masked_masked.max(dim=1)
+        else:
+            raise ValueError("pool must be 'mean' or 'max'")
+
+        all_embs.append(pooled.cpu())
+
+    all_embs = torch.cat(all_embs, dim=0)   # (N, hidden_size)
+    return all_embs
+
+
+
+
+# use real items built from e_event
+ds = TextWithEventsDataset(items, tokenizer)
 dl = DataLoader(ds, batch_size=BATCH, collate_fn=collate_fn)
+
 
 for epoch in range(EPOCHS):
     loss = train_epoch(dl)
@@ -627,3 +699,32 @@ for epoch in range(EPOCHS):
 
 model.save_pretrained("./peft_lora_multimodal")
 tokenizer.save_pretrained("./peft_lora_multimodal")
+
+# optional: save projector
+torch.save(projector.state_dict(), "projector.pt")
+
+# extract embeddings (no ids now)
+embs = extract_event_prefix_embeddings(
+    dl,
+    model=model,
+    projector=projector,
+    device=DEVICE,
+    d_model=d_model,
+    embed_dim=embed_dim,
+    pool="mean",
+)
+
+print("Extracted embeddings:", embs.shape)  # (N, hidden_size)
+
+# save as torch tensor
+torch.save(embs, "event_prefix_embeddings.pt")
+
+# or also as pickle with numpy
+import numpy as np
+import pickle
+
+embs_np = embs.numpy()
+with open("event_prefix_embeddings.pkl", "wb") as f:
+    pickle.dump({"embeddings": embs_np}, f)
+
+print("Saved event embeddings to event_prefix_embeddings.pt / .pkl")
