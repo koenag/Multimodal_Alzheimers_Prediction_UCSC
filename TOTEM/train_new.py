@@ -562,26 +562,29 @@ model.gradient_checkpointing_enable()
 scaler = torch.amp.GradScaler()
 
 def collate_fn(batch):
-    prompts = [b["input_text"] for b in batch]
-    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    input_ids = encoded.input_ids
-    attention_mask = encoded.attention_mask
-    labels = input_ids.clone()
+    # batch = list of sequences; each sequence is a list of events
+    masked_seqs = []
+    label_seqs = []
+    maskinfo_seqs = []
+    attn_masks = []
 
-    evs = [b["event_embeddings"] for b in batch]  # list of (T_i, D)
-    ev_padded = pad_sequence(evs, batch_first=True)  # (B, T_ev, D)
-    ev_mask = torch.stack([torch.cat([torch.ones(e.shape[0]), torch.zeros(ev_padded.shape[1] - e.shape[0])]) 
-                           for e in evs])
-    
+    for seq in batch:
+        masked_embs, labels, maskinfo = mask_events(seq)
+
+        masked_seqs.append(masked_embs)
+        label_seqs.append(labels)
+        maskinfo_seqs.append(maskinfo)
+        attn_masks.append(torch.ones(len(seq)).bool())
+
+    padded_embs = pad_sequence(masked_seqs, batch_first=True)  # (B, T_max, d_model)
+    padded_attn = pad_sequence(attn_masks, batch_first=True, padding_value=0)
+
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "event_embeddings": ev_padded,
-        "event_mask": ev_mask,
+        "embeddings": padded_embs,
+        "labels": label_seqs,
+        "maskinfo": maskinfo_seqs,
+        "attn_mask": padded_attn,
     }
-
-    return batch_data
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
@@ -625,6 +628,54 @@ def train_epoch(dataloader):
         torch.cuda.empty_cache()
         
     return total_loss / len(dataloader.dataset)
+
+import random
+
+def mask_events(batch_events, mask_prob=0.15, d_model=768):
+    """
+    batch_events: list of dicts per event:
+       {
+         "embedding": tensor(d_model),
+         "value": float or int,
+         "var_type": "continuous" or "categorical",
+         "variate_name": string
+       }
+    """
+
+    masked_embeddings = []
+    labels = []
+    mask_info = []     # (is_masked, var_type, variate_name)
+
+    MASK_VALUE_EMB = torch.zeros(d_model)  # learned mask embedding can replace this
+
+    for event in batch_events:
+        emb = event["embedding"].clone()
+        value = event["value"]
+        var_type = event["var_type"]
+        variate = event["variate_name"]
+
+        if random.random() < mask_prob:
+            # mask only the value embedding inside the event
+            # time_embed + variate_embed stay the same
+
+            # event["value_embed"] must be stored separately in practice
+            value_emb = event["value_embed"]
+            emb = emb - value_emb + MASK_VALUE_EMB  # replace value component
+
+            masked = True
+        else:
+            masked = False
+
+        masked_embeddings.append(emb)
+        labels.append(value)
+        mask_info.append((masked, var_type, variate))
+
+    return (
+        torch.stack(masked_embeddings),  # (T, d_model)
+        labels,                          # python list
+        mask_info                        # python list
+    )
+
 
 import pickle
 
